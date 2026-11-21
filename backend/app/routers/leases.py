@@ -1,5 +1,4 @@
 from __future__ import annotations
-from app.services import reschedule_panel
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -72,5 +71,13 @@ class RescheduleBody(BaseModel):
 
 @router.post("/reschedule")
 def reschedule(body: RescheduleBody):
-    with transaction() as conn:
-        return reschedule_panel.paint_reschedule(conn, body.window_code, body.new_slot)
+    # 与 open_lease 同一口径：预检→迁移→展示字段→回执都在 transaction()
+    # （BEGIN IMMEDIATE 写锁）内一次落；冲突失败落冲突行后整体提交，其余失败回滚。
+    try:
+        with transaction() as conn:
+            result = lease_svc.reschedule_lease(conn, body.window_code, body.new_slot)
+        if result.get("ok") is False:
+            raise HTTPException(409, result.get("error") or "改挂冲突")
+        return result
+    except ValueError as e:
+        raise HTTPException(409, str(e)) from e

@@ -24,6 +24,26 @@
   且 `live_sessions` 与 open 租约数一致；`/api/dashboard` 返回
   `watermarks_consistent` 供页面显示。
 
+## live 改挂口径（全局唯一）：以占用索引现行键为准
+
+改挂不是「先关窗再开」，也不是只写回执快照——而是**写锁内一次原子迁移占用索引键**：
+
+- `POST /api/reschedule` 在 `transaction()` 写锁内完成：读 open 租约 →
+  对新槽做冲突预检（与开窗同一套 ready 口径，排除自己）→
+  **同一条 UPDATE** 释放旧键、占用新键（原子，无半截）→
+  批窗展示字段（`windows.slot_code`）跟随索引 → 写回执。
+- **回执只是索引的投影**：总览的「最近改挂」必须能由占用索引重放——
+  索引现行键≠回执新槽时亮 `torn`，绝不宣称成功，也绝不用回执漂白
+  `watermarks_consistent`；租约已关窗则落 `settled`（历史回执）。
+- **水位按净变迁**：一键换一键，`open_leases` 净零不动；
+  预检冲突失败落冲突行（`conflict_count` 净 +1），其余失败整体回滚——
+  不留双键、不留假回执、不动展示字段。
+- **并发改挂串行**：`BEGIN IMMEDIATE` 排队，后到者看到先到者已提交的现行键
+  再迁；双目标并发最终只落一键，同目标并发幂等；改挂与关窗交错时，
+  关窗先提交则改挂整体 409。
+- 数据库层兜底同开窗：`trg_lease_slot_overlap_upd` /
+  `trg_lease_executor_overlap_upd` 更新触发器把第二道防线延伸到迁移路径。
+
 候补池在 seed 中给出：`S-ETL-SB1`（优先级 10）、`S-ETL-SB2`（20）、`S-BI-SB1`（10）。
 
 ## 本地冒烟（推荐）
@@ -49,6 +69,9 @@ npm run dev
 - `_concurrency_check.py`：多路并发降级抢同一候补池，验证「成功数=空闲候补数、
   失败可查、无双重占、同窗至多一笔 open」。
 - `_stress_check.py`：多轮高并发压测，验证无 5xx、水位始终一致。
+- `_reschedule_check.py`：live 改挂夹具——回执新槽=索引现行=批窗展示、
+  旧槽可开/新槽挡/水位不双计、失败回滚不留双键、关窗交错整体回滚、
+  并发双改挂收敛、撕裂注入下总览亮 torn 不漂白。
 
 三脚本都只依赖标准库，对运行中的 API 发请求：
 
@@ -56,6 +79,7 @@ npm run dev
 python _smoke_api.py                      # 默认连 11100
 python _concurrency_check.py http://127.0.0.1:11100/api
 python _stress_check.py      http://127.0.0.1:11100/api
+python _reschedule_check.py  http://127.0.0.1:11100/api  # 第二参数可给库文件路径做撕裂注入
 ```
 
 可用环境变量 `CURTAINCLOCK_DB` 把后端指向独立库文件，便于并行自检互不干扰。

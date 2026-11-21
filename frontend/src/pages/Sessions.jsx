@@ -9,15 +9,72 @@ function fmtMin(m) {
 
 const statusLabel = { draft: "待开窗", live: "占用中", done: "已结束" };
 
+// live 改挂入口：目标槽下拉 + 改挂按钮。改挂是占用索引的键迁移，
+// 成功后回执新槽 = 索引现行键 = 本页展示槽，三处同源可互证。
+function RescheduleCell({ row, slots, onDone, onError }) {
+  const [target, setTarget] = useState(row.slot_code);
+  const [busy, setBusy] = useState(false);
+
+  async function submit() {
+    setBusy(true);
+    onError("");
+    try {
+      const r = await api.reschedule(row.code, target);
+      onDone(
+        `已改挂 ${r.lease_no}：${r.old_slot} → ${r.new_slot}；在途租约 ${r.open_leases}`
+      );
+    } catch (e) {
+      onError(e.message);
+      await onDone("");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const occupiedBy = (code) => {
+    const s = slots.find((x) => x.code === code);
+    return s && s.occupied ? "（占用）" : "";
+  };
+
+  return (
+    <span className="reschedule">
+      <select
+        value={target}
+        disabled={busy}
+        onChange={(e) => setTarget(e.target.value)}
+      >
+        {slots
+          .filter((s) => s.active)
+          .map((s) => (
+            <option key={s.code} value={s.code}>
+              {s.code}
+              {s.code === row.slot_code ? "（现行）" : occupiedBy(s.code)}
+            </option>
+          ))}
+      </select>
+      <button
+        className="secondary"
+        disabled={busy || target === row.slot_code}
+        onClick={submit}
+      >
+        改挂
+      </button>
+    </span>
+  );
+}
+
 export default function Sessions() {
   const [rows, setRows] = useState([]);
+  const [slots, setSlots] = useState([]);
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
 
   async function load() {
     setErr("");
     try {
-      setRows(await api.windows());
+      const [w, s] = await Promise.all([api.windows(), api.slots()]);
+      setRows(w);
+      setSlots(s);
     } catch (e) {
       setErr(e.message);
     }
@@ -41,6 +98,11 @@ export default function Sessions() {
       setErr(e.message);
       await load();
     }
+  }
+
+  async function afterReschedule(text) {
+    if (text) setMsg(text);
+    await load();
   }
 
   return (
@@ -97,12 +159,25 @@ export default function Sessions() {
                   </span>
                 </td>
                 <td>
-                  <button
-                    disabled={r.status !== "draft"}
-                    onClick={() => openLease(r.code)}
-                  >
-                    开窗占用
-                  </button>
+                  {r.status === "live" ? (
+                    <RescheduleCell
+                      key={r.slot_code}
+                      row={r}
+                      slots={slots}
+                      onDone={afterReschedule}
+                      onError={(m) => {
+                        setMsg("");
+                        setErr(m);
+                      }}
+                    />
+                  ) : (
+                    <button
+                      disabled={r.status !== "draft"}
+                      onClick={() => openLease(r.code)}
+                    >
+                      开窗占用
+                    </button>
+                  )}
                 </td>
               </tr>
             );
@@ -112,4 +187,3 @@ export default function Sessions() {
     </section>
   );
 }
-

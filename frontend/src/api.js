@@ -28,4 +28,6 @@ export const api = {
     req("/leases/open", { method: "POST", body: JSON.stringify({ window_code }) }),
   closeLease: (lease_no) =>
     req("/leases/close", { method: "POST", body: JSON.stringify({ lease_no }) }),
+  reschedule: (window_code, new_slot) =>
+    req("/reschedule", { method: "POST", body: JSON.stringify({ window_code, new_slot }) }),
 };

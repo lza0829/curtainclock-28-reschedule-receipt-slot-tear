@@ -224,6 +224,26 @@ button:disabled {
   color: var(--danger);
 }
 
+.msg.muted {
+  background: #f4f5f3;
+  border-color: #d8ddd6;
+  color: #5b655d;
+}
+
+.reschedule {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.reschedule select {
+  font-family: inherit;
+  padding: 6px 8px;
+  border: 1px solid #cfd6cf;
+  border-radius: 4px;
+  background: #fff;
+}
+
 .row-actions {
   display: flex;
   gap: 8px;

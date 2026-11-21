@@ -1,5 +1,4 @@
 from __future__ import annotations
-from app.services import reschedule_panel
 
 import sqlite3
 from datetime import datetime, timezone
@@ -8,7 +7,9 @@ from app.services.ready import (
     executor_blocker,
     free_standbys,
     main_slot_blocker,
+    resource_busy,
 )
+from app.services.settings_util import put_json
 
 # ============================================================================
 # 并发口径（全局唯一）：**开窗写锁内一次扫落**
@@ -35,6 +36,11 @@ def _bump(conn: sqlite3.Connection, key: str, delta: int) -> int:
         (key, nxt, _now()),
     )
     return nxt
+
+
+def _watermark(conn: sqlite3.Connection, key: str) -> int:
+    row = conn.execute("SELECT value FROM watermarks WHERE key=?", (key,)).fetchone()
+    return int(row["value"]) if row else 0
 
 
 def _next_lease_no(conn: sqlite3.Connection, day: str) -> str:
@@ -200,3 +206,113 @@ def close_lease(conn: sqlite3.Connection, lease_no: str) -> dict:
         "status": "closed",
         "open_leases": open_n,
     }
+
+
+def reschedule_lease(conn: sqlite3.Connection, window_code: str, new_slot: str) -> dict:
+    """live 改挂：把占用中租约从现行槽迁到 new_slot。
+
+    索引架构（全局唯一口径）：占用索引（leases 的 open 行）现行键是唯一事实源。
+    预检 → 迁移 → 批窗展示字段 → 回执，全部在调用方持有的写锁、同一事务内完成：
+      - 旧键释放与新键占用是同一条 UPDATE，原子，不存在半截；
+      - 水位按净变迁：open_leases 一键换一键，净零，不 bump；
+      - 回执只是索引现行态的投影，必须能由索引重放（见 routers/dashboard）；
+      - 任一步失败整个事务回滚：不留双键、不留假回执、不动展示字段。
+    并发改挂由 BEGIN IMMEDIATE 串行：后到者看到先到者已提交的现行键，
+    从现行键再迁，双目标并发最终只落一键。
+    """
+    window = conn.execute(
+        "SELECT * FROM windows WHERE code=?", (window_code,)
+    ).fetchone()
+    if window is None:
+        raise ValueError(f"批窗不存在：{window_code}")
+    lease = conn.execute(
+        "SELECT * FROM leases WHERE window_code=? AND status='open'",
+        (window_code,),
+    ).fetchone()
+    if lease is None:
+        # 与关窗交错：关窗先提交则这里必然看不到 open 租约——
+        # 改挂整体拒绝并回滚，不得留下「窗已关、键已迁」的半截。
+        raise ValueError("批窗不在占用态，无可改挂的租约")
+    old_slot = lease["slot_code"]
+
+    if new_slot == old_slot:
+        # 目标即现行键：幂等重放，由索引直接回执，不落任何写。
+        return {
+            "ok": True,
+            "lease_no": lease["lease_no"],
+            "window_code": window_code,
+            "old_slot": old_slot,
+            "new_slot": new_slot,
+            "slot_code": lease["slot_code"],
+            "status": "open",
+            "open_leases": _watermark(conn, "open_leases"),
+            "at": _now(),
+        }
+
+    # ---- 冲突预检（与开窗同一套 ready 口径，排除自己）----
+    # 目标槽须存在、启用、时段空闲；预检失败落冲突行（由调用方提交），
+    # 租约/批窗/水位一概不动——失败回滚不留双键。
+    slot = conn.execute(
+        "SELECT * FROM slots WHERE code=?", (new_slot,)
+    ).fetchone()
+    if slot is None:
+        reason = f"算力槽 {new_slot} 不存在"
+        _record_conflict(
+            conn, kind="room", session=window, resource_code=new_slot, reason=reason
+        )
+        return {"ok": False, "error": reason}
+    if slot["active"] != 1:
+        reason = f"算力槽 {new_slot} 未启用"
+        _record_conflict(
+            conn, kind="room", session=window, resource_code=new_slot, reason=reason
+        )
+        return {"ok": False, "error": reason}
+    busy = resource_busy(
+        conn,
+        kind="room",
+        resource_code=new_slot,
+        day=lease["day"],
+        start_min=lease["start_min"],
+        end_min=lease["end_min"],
+        exclude_session=window_code,
+    )
+    if busy is not None:
+        reason = f"算力槽 {new_slot} 已被租约 {busy['lease_no']} 占用"
+        _record_conflict(
+            conn, kind="room", session=window, resource_code=new_slot, reason=reason
+        )
+        return {"ok": False, "error": reason}
+
+    # ---- 原子迁移：旧键释放 + 新键占用 = 同一条 UPDATE ----
+    # 改挂后目标槽即批窗新主槽：main_slot_code 跟随、degraded 归零。
+    # 更新触发器（trg_lease_slot_overlap_upd 等）是第二道防线。
+    try:
+        conn.execute(
+            "UPDATE leases SET slot_code=?, main_slot_code=?, degraded=0 "
+            "WHERE lease_no=? AND status='open'",
+            (new_slot, new_slot, lease["lease_no"]),
+        )
+    except sqlite3.IntegrityError as e:
+        # 写锁内理论上到不了这里；到了说明口径被破坏，抛出让整个事务回滚。
+        raise ValueError(f"改挂被占用索引拒绝：{e}") from e
+    # 批窗展示字段跟随索引现行键（同事务，不外溢）。
+    conn.execute(
+        "UPDATE windows SET slot_code=? WHERE code=?",
+        (new_slot, window_code),
+    )
+
+    # 回执 = 迁移后索引现行态的投影（可重放）；settings 仅作审计留痕。
+    payload = {
+        "ok": True,
+        "lease_no": lease["lease_no"],
+        "window_code": window_code,
+        "old_slot": old_slot,
+        "new_slot": new_slot,
+        "slot_code": new_slot,
+        "status": "open",
+        "open_leases": _watermark(conn, "open_leases"),
+        "at": _now(),
+    }
+    put_json(conn, f"reschedule:{window_code}", payload)
+    put_json(conn, "reschedule_last", payload)
+    return payload

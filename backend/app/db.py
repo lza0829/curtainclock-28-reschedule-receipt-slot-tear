@@ -10,6 +10,9 @@ from app.config import DB_PATH
 # 正式 open 落库三件事发生在同一把写锁、同一个连接、同一个事务内。
 # 因此并发两路同时抢同一候补时，后到者一定能看到先到者已提交的 open 租约，
 # 只能改选下一个候补或失败，不会出现「双候补 open」。
+# live 改挂同此口径：以占用索引（leases 的 open 行）现行键为唯一事实源，
+# 预检→迁移→批窗展示字段→回执都在同一把写锁、同一事务内完成；
+# 旧键释放与新键占用是同一条 UPDATE，原子；回执只是索引的投影，必须能由索引重放。
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS slots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,6 +111,38 @@ BEGIN
     WHERE status = 'open'
       AND executor_code = NEW.executor_code
       AND day = NEW.day
+      AND NEW.start_min < end_min
+      AND start_min < NEW.end_min
+  );
+END;
+-- 改挂迁移走 UPDATE，同样需要第二道防线：与插入触发器同口径，
+-- 排除自身行，防止任何路径把 open 租约改到已被占用的槽/执行器上（双键兜底）。
+CREATE TRIGGER IF NOT EXISTS trg_lease_slot_overlap_upd
+BEFORE UPDATE OF slot_code, day, start_min, end_min, status ON leases
+WHEN NEW.status = 'open'
+BEGIN
+  SELECT RAISE(ABORT, 'slot_overlap')
+  WHERE EXISTS (
+    SELECT 1 FROM leases
+    WHERE status = 'open'
+      AND slot_code = NEW.slot_code
+      AND day = NEW.day
+      AND id <> NEW.id
+      AND NEW.start_min < end_min
+      AND start_min < NEW.end_min
+  );
+END;
+CREATE TRIGGER IF NOT EXISTS trg_lease_executor_overlap_upd
+BEFORE UPDATE OF executor_code, day, start_min, end_min, status ON leases
+WHEN NEW.status = 'open'
+BEGIN
+  SELECT RAISE(ABORT, 'executor_overlap')
+  WHERE EXISTS (
+    SELECT 1 FROM leases
+    WHERE status = 'open'
+      AND executor_code = NEW.executor_code
+      AND day = NEW.day
+      AND id <> NEW.id
       AND NEW.start_min < end_min
       AND start_min < NEW.end_min
   );

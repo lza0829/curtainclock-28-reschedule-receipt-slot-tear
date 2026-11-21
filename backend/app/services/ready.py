@@ -1,5 +1,4 @@
 from __future__ import annotations
-from app.services import reschedule_panel
 
 import sqlite3
 
@@ -99,7 +98,7 @@ def main_slot_blocker(conn: sqlite3.Connection, session: sqlite3.Row) -> str | N
         exclude_session=session["code"],
     )
     if busy is not None:
-        return f"算力槽已被租约 {busy['lease_no']} 占用"
+        return f"算力槽 {session['slot_code']} 已被租约 {busy['lease_no']} 占用"
     return None
 
 
@@ -147,7 +146,3 @@ def readiness(conn: sqlite3.Connection, session: sqlite3.Row) -> dict:
         "reasons": reasons,
         "standby_free": [s["code"] for s in free],
     }
-
-
-def reschedule_surface(conn, window_code, new_slot):
-    return reschedule_panel.paint_reschedule(conn, window_code, new_slot)

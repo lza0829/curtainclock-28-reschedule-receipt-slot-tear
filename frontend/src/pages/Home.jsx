@@ -44,10 +44,30 @@ export default function Home() {
       </div>
       <div className={`msg ${ok ? "" : "err"}`}>
         水位互证：
-        {"一致"} · 在途租约水位 {d.open_leases} / 实槽 {d.open_leases_actual}
+        {ok ? "一致" : "不一致"} · 在途租约水位 {d.open_leases} / 实槽{" "}
+        {d.open_leases_actual}
         {" / 占用中批窗 "}
         {d.live_sessions} · 冲突水位 {d.conflict_count} / 实槽 {d.conflict_count_actual}
       </div>
+      {d.reschedule_last && (
+        <div
+          className={`msg ${
+            d.reschedule_state === "torn"
+              ? "err"
+              : d.reschedule_state === "settled"
+                ? "muted"
+                : ""
+          }`}
+        >
+          最近改挂：{d.reschedule_last.window_code} ·{" "}
+          {d.reschedule_last.old_slot} → {d.reschedule_last.new_slot}（租约{" "}
+          {d.reschedule_last.lease_no}）· 索引重放
+          {d.reschedule_state === "replayed" && `一致，现行槽 ${d.display_slot}`}
+          {d.reschedule_state === "torn" &&
+            `撕裂：回执新槽 ${d.reschedule_last.new_slot}，索引现行 ${d.display_slot}`}
+          {d.reschedule_state === "settled" && "已关窗（历史回执）"}
+        </div>
+      )}
     </section>
   );
 }
